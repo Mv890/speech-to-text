@@ -30,7 +30,7 @@
 * screen 1(recorder)=A clean interface featuring a Start/Stop recording button alongside a live text display area for the real-time transcript
 * screen 2(history)=A dashboard displaying a list of past recording sessions
 
-DAY 2
+DAY 2:-
 create a custome ui using a tailwand css
 
 
