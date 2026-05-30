@@ -4,10 +4,13 @@ import { useState, useRef, useEffect, JSX } from "react";
 
 export default function RecorderPanel(): JSX.Element {
   const [isRecording, setIsRecording] = useState(false);
-  const [isTranscribing, setIsTranscribing] = useState(false); // NEW: AI loading state
+  const [isTranscribing, setIsTranscribing] = useState(false);
   const [recordingTime, setRecordingTime] = useState(0);
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  
+  // NEW: State to hold the transcript text instead of using a popup
+  const [transcript, setTranscript] = useState<string | null>(null);
   
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<BlobPart[]>([]);
@@ -23,6 +26,7 @@ export default function RecorderPanel(): JSX.Element {
     try {
       setError(null);
       setAudioUrl(null);
+      setTranscript(null); // Clear the old transcript when starting a new recording
       setRecordingTime(0);
       
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -34,20 +38,17 @@ export default function RecorderPanel(): JSX.Element {
         if (event.data.size > 0) audioChunksRef.current.push(event.data);
       };
 
-      // THE MAGIC HAPPENS HERE WHEN YOU CLICK STOP
       mediaRecorder.onstop = async () => {
         const audioBlob = new Blob(audioChunksRef.current, { type: "audio/webm" });
         const localAudioUrl = URL.createObjectURL(audioBlob);
         setAudioUrl(localAudioUrl);
 
-        // --- DAY 5: SEND TO AI BACKEND ---
-        setIsTranscribing(true); // Turn on the loading text
+        setIsTranscribing(true); 
         
         try {
           const formData = new FormData();
           formData.append("audio", audioBlob, "recording.webm");
 
-          // Throw the file to the Python server!
           const response = await fetch("http://127.0.0.1:5000/transcribe", {
             method: "POST",
             body: formData,
@@ -55,16 +56,16 @@ export default function RecorderPanel(): JSX.Element {
 
           const data = await response.json();
 
-          // If successful, show the alert!
           if (data.status === 'success') {
-            alert("AI TRANSCRIPT:\n\n" + data.transcript);
+            // NEW: Save the text to state instead of alerting it!
+            setTranscript(data.transcript);
           } else {
-            alert("AI Error:\n\n" + (data.error || "Something went wrong"));
+            setError("AI Error: " + (data.error || "Something went wrong"));
           }
         } catch (err) {
-          alert("Could not connect to Python backend! Is it running?");
+          setError("Could not connect to Python backend! Is it running?");
         } finally {
-          setIsTranscribing(false); // Turn off the loading text
+          setIsTranscribing(false); 
         }
       };
 
@@ -131,10 +132,10 @@ export default function RecorderPanel(): JSX.Element {
           </button>
         </div>
 
-        {/* NEW: AI Loading text */}
         {isTranscribing && (
-          <div className="mt-4 text-[#534AB7] text-[14px] font-medium animate-pulse">
-            🤖 AI is transcribing your audio...
+          <div className="mt-6 text-[#534AB7] text-[15px] font-medium animate-pulse flex items-center gap-2">
+            <div className="w-4 h-4 border-2 border-[#534AB7] border-t-transparent rounded-full animate-spin"></div>
+            Deepgram AI is typing...
           </div>
         )}
         
@@ -149,6 +150,16 @@ export default function RecorderPanel(): JSX.Element {
           <div className="mt-[24px] w-full flex flex-col items-center gap-[12px] p-[16px] bg-[#F8F9FA] rounded-[8px] border-[1px] border-[#E9ECEF]">
             <span className="text-[13px] font-medium text-[#495057]">Preview Recording</span>
             <audio src={audioUrl} controls className="w-full h-[40px]" />
+          </div>
+        )}
+
+        {/* NEW: The Transcript Panel */}
+        {transcript && (
+          <div className="mt-[24px] w-full text-left">
+            <h3 className="text-[14px] font-bold text-[#3C3489] mb-[8px] uppercase tracking-wider">Transcript</h3>
+            <div className="p-[16px] bg-[#F4F3FF] rounded-[8px] border-[1px] border-[#CECBF6] text-[#333333] leading-relaxed">
+              {transcript}
+            </div>
           </div>
         )}
       </div>
