@@ -1,7 +1,12 @@
+import eventlet
+eventlet.monkey_patch()
+
 import os
-import requests
-from flask import Flask, request, jsonify
+import json
+import websocket
+from flask import Flask, jsonify, request
 from flask_cors import CORS
+from flask_socketio import SocketIO
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -9,86 +14,77 @@ load_dotenv()
 app = Flask(__name__)
 CORS(app)
 
-UPLOAD_FOLDER = "uploads"
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
 
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
-
-# --- DAY 7: ROBUST SECURITY GUARDS & VALIDATIONS ---
-MAX_FILE_SIZE = 10 * 1024 * 1024  # Strict 10MB limit guard
-ALLOWED_EXTENSIONS = {'webm', 'wav', 'mp3', 'm4a', 'ogg'}
-
-def allowed_file(filename):
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+active_tunnels = {}
 
 @app.route('/', methods=['GET'])
 def home():
-    return jsonify({
-        "status": "online", 
-        "message": "AI Speech-to-Text API is awake and ready for audio!"
-    }), 200
+    return jsonify({"status": "online", "message": "WebSocket Server is LIVE!"}), 200
 
-@app.route('/transcribe', methods=['POST'])
-def transcribe():
-    # 1. VALIDATION: Check if file exists in request
-    f = request.files.get('audio') or request.files.get('file')
-    if not f:
-        return jsonify({'error': 'No audio file provided in the request.'}), 400
+@socketio.on('connect')
+def handle_connect():
+    client_sid = request.sid 
+    print(f"\n🟢 Client Connected: {client_sid}")
     
-    # 2. VALIDATION: Validate file extension type
-    if not allowed_file(f.filename):
-        return jsonify({'error': f'Unsupported file format. Allowed: {", ".join(ALLOWED_EXTENSIONS)}'}), 400
+    def on_message(ws, message):
+        data = json.loads(message)
+        if data.get('type') == 'Error':
+            print(f"❌ DEEPGRAM REJECTED AUDIO: {data.get('err_msg')}")
+            return
 
-    # 3. VALIDATION: File size guard check
-    file_bytes = f.read()
-    if len(file_bytes) > MAX_FILE_SIZE:
-        return jsonify({'error': 'Audio file is too large! Maximum limit is 10MB.'}), 413
+        if data.get('channel') and data['channel']['alternatives'][0]['transcript']:
+            transcript = data['channel']['alternatives'][0]['transcript']
+            is_final = data.get('is_final', False)
+            print(f"🧠 AI HEARD: {transcript}")
+            socketio.emit('transcript_update', {'text': transcript, 'is_final': is_final}, to=client_sid)
+
+    def on_error(ws, error):
+        if "sock" in str(error):
+            return
+        print(f"⚠️ Deepgram Error: {error}")
+
+    def on_close(ws, close_status_code, close_msg):
+        print("🔴 Deepgram Tunnel Closed")
+
+    def on_open(ws):
+        print("🚀 Deepgram Tunnel Opened! (Audio streaming ready)")
+        # THIS IS THE FIX: Send the green light to React!
+        socketio.emit('deepgram_ready', to=client_sid)
+
+    # NATIVE KEEPALIVE ADDED TO URL! Deepgram will never hang up due to silence now.
+    dg_url = "wss://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&interim_results=true&keepalive=true"
     
-    # Reset file pointer after checking size so we can save it safely
-    f.seek(0)
-        
-    path = os.path.join(UPLOAD_FOLDER, f.filename)
-    f.save(path)
+    dg_ws = websocket.WebSocketApp(
+        dg_url,
+        header=[f'Authorization: Token {DEEPGRAM_API_KEY}'],
+        on_message=on_message,
+        on_error=on_error,
+        on_close=on_close,
+        on_open=on_open 
+    )
     
-    if not DEEPGRAM_API_KEY:
-        return jsonify({'error': 'Server configuration error: API key is missing!'}), 500
+    socketio.start_background_task(dg_ws.run_forever)
+    active_tunnels[client_sid] = dg_ws
 
-    try:
-        # --- ROBUST STREAMING STRATEGY ---
-        with open(path, 'rb') as audio_file:
-            url = "https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true"
-            
-            headers = {
-                "Authorization": f"Token {DEEPGRAM_API_KEY}",
-                "Content-Type": "audio/webm"  # Deepgram handles webm natively!
-            }
-            
-            response = requests.post(url, headers=headers, data=audio_file)
-            response_data = response.json()
+@socketio.on('audio_chunk')
+def handle_audio(data):
+    print(f"🎤 Received {len(data)} bytes! Routing to AI...", end="\r")
+    
+    dg_ws = active_tunnels.get(request.sid)
+    if dg_ws:
+        try:
+            dg_ws.send(data, opcode=websocket.ABNF.OPCODE_BINARY)
+        except Exception as e:
+            print(f"⚠️ Failed to route to Deepgram: {e}")
 
-            # Server-side validation check on external API response
-            if response.status_code != 200:
-                print("\n\n--- DEEPGRAM API ERROR ---")
-                print(response_data)
-                print("--------------------------\n\n")
-                return jsonify({'error': 'AI cloud provider rejected the request.', 'details': response_data}), 500
-
-            # Extract the speech transcript from response structure safely
-            real_transcript = response_data['results']['channels'][0]['alternatives'][0]['transcript']
-
-        # --- WINDOWS FILE LOCK FIX --- 
-        # Python closes the file automatically because we left the 'with open()' block.
-        # Now it is safe to delete it without Windows yelling at us!
-        if os.path.exists(path):
-            os.remove(path)
-
-        return jsonify({
-            'status': 'success',
-            'transcript': real_transcript
-        }), 200
-
-    except Exception as e:
-        return jsonify({'error': f'Internal server exception: {str(e)}'}), 500
+@socketio.on('disconnect')
+def handle_disconnect():
+    print(f"\n🔴 Client Disconnected: {request.sid}")
+    dg_ws = active_tunnels.pop(request.sid, None)
+    if dg_ws:
+        dg_ws.close()
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+    socketio.run(app, debug=True, port=5000)
